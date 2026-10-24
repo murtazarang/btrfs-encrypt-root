@@ -21,6 +21,26 @@ This is NOT resumable: after an error, inspect the state before reboot/rerun.
 HELP
 }
 
+assert_root_last_partition() {
+    layout_partition_number=$1
+    layout_table=$2
+    case "$layout_partition_number" in
+        ''|0|*[!0-9]*) die 'Cannot determine a valid root partition number';;
+    esac
+    layout_root_end=$(printf '%s\n' "$layout_table" | awk -F: -v n="$layout_partition_number" '$1==n {gsub("s","",$3);print $3}')
+    # Removing the sector suffix makes the field a string. Compare numerically,
+    # but retain the original digits so large values are not printed as exponents.
+    layout_last_end=$(printf '%s\n' "$layout_table" | awk -F: '
+        $1 ~ /^[0-9]+$/ {
+            gsub("s","",$3)
+            if (($3+0) > (max+0)) max=$3
+        }
+        END {print max}
+    ')
+    [ -n "$layout_root_end" ] && [ "$layout_root_end" = "$layout_last_end" ] ||
+        die '--enlarge requires root to be the physically last partition'
+}
+
 migrate_directory() {
     source_dir=$1
     destination_dir=$2
@@ -499,12 +519,10 @@ main() {
     [ -n "$filesystem_uuid" ] && [ -n "$boot_uuid" ] || die 'Missing filesystem UUID'
     if [ "$enlarge" = yes ]; then
         [ "$(lsblk -dn -o PTTYPE "$disk")" = gpt ] || die '--enlarge requires GPT'
-        partition_number=$(lsblk -dn -o PARTN "$root_dev" | awk '{$1=$1;print}')
+        partition_number=$(lsblk -dn -o PARTN "$root_dev") || die 'Cannot read root partition number'
+        partition_number=$(printf '%s\n' "$partition_number" | awk '{$1=$1;print}')
         table=$(parted -ms "$disk" unit s print)
-        root_end=$(printf '%s\n' "$table" | awk -F: -v n="$partition_number" '$1==n {gsub("s","",$3);print $3}')
-        last_end=$(printf '%s\n' "$table" | awk -F: '$1 ~ /^[0-9]+$/ {gsub("s","",$3);if($3>max)max=$3} END{print max}')
-        [ -n "$root_end" ] && [ "$root_end" = "$last_end" ] ||
-            die '--enlarge requires root to be the physically last partition'
+        assert_root_last_partition "$partition_number" "$table"
     fi
     while IFS= read -r swap_path; do
         [ -n "$swap_path" ] || continue
