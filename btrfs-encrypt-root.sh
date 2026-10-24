@@ -1,163 +1,241 @@
 #!/bin/sh
-# Based on shukriadams/btrfs-encrypt-root (AGPL-3.0).
-# Run once from the Ubuntu 26.04 live USB after installation, before reboot.
-set -eu
+# Based on shukriadams/btrfs-encrypt-root; minimal Ubuntu 26.04 adaptation.
+set -e
 
-script=$(readlink -f "$0")
+script=`readlink -f "$0"`
+scriptname=`basename "$script"`
+scriptpath=`dirname "$script"`
+
+[ `id -u` -eq 0 ] || { echo "ERROR: Must be run as root."; exit 1; }
+
 mp=/mnt/root
 keyslot_size=32m
 
-fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-show_help() {
-    cat <<'HELP'
-Usage: btrfs-encrypt-root.sh [--enlarge] [--only-subvols] ROOT BOOT [EFI]
-All device names omit /dev/. ROOT is initially unencrypted Btrfs;
-BOOT is a separate ext4 partition; EFI is a separate FAT32 partition.
-Creates @, @home, @var_cache, @var_log, @var_tmp on the same Btrfs volume.
---enlarge: extend the last root partition into trailing unallocated space.
---only-subvols: create subvolumes without encryption.
-HELP
+preparation() {
+    echo "Prepare"
+    if [ $efi = true ]
+    then
+        umount /target/boot/efi
+    fi
+    umount /target/boot
+    umount /target/cdrom
+    umount /target
+
+    mkdir $mp
 }
 
-# Called from inside the newly installed system.
-configure_installed_system() {
-    only_subvols=$1
-    root_device=$2
-    if [ "$only_subvols" = yes ]; then
-        source="UUID=$(blkid -s UUID -o value "$root_device")"
+create_subvols() {
+    echo "Create subvolumes"
+    mount /dev/"$1" $mp
+    cd $mp
+
+    btrfs subvolume snapshot . @
+
+    # Only additions to the upstream Btrfs layout. Copy inside the root
+    # filesystem so hidden files never pass through the live USB's /tmp.
+    for pair in home:@home var/cache:@var_cache var/log:@var_log var/tmp:@var_tmp
+    do
+        dir=${pair%:*}
+        subvol=${pair#*:}
+        btrfs subvolume create "$subvol"
+        cp -a "@/$dir/." "$subvol/"
+        find "@/$dir" -mindepth 1 -maxdepth 1 -exec rm -Rf -- {} +
+    done
+    chmod 1777 @var_tmp
+
+    find -maxdepth 1 \! -name "@*" \! -name . -exec rm -Rf {} \;
+
+    cd /
+    umount $mp
+    echo "Mount @ instead of /"
+    mount /dev/"$1" -o subvol=@ $mp
+}
+
+encrypt_and_enlarge() {
+    echo "Encrypt $1"
+    btrfs filesystem resize -$keyslot_size $mp
+    cd /
+    umount $mp
+    disk=`lsblk --noheadings --output pkname /dev/"$1"`
+    partition_number=`lsblk --noheadings --output partn /dev/"$1" | tr -d "[:space:]"`
+    echo 'You may ignore “Warning: keyslot operation could fail …”.'
+    echo 'See <https://gitlab.com/cryptsetup/cryptsetup/-/issues/896>.'
+    cryptsetup reencrypt --encrypt --type luks2 --reduce-device-size $keyslot_size /dev/"$1"
+    if [ $enlarge = yes ]
+    then
+        echo "Enlarge $1"
+        parted --script /dev/"$disk" resizepart "$partition_number" "100%"
+    fi
+    cryptsetup open /dev/"$1" root
+    mount /dev/mapper/root -o subvol=@ $mp
+    btrfs filesystem resize max $mp
+}
+
+chroot_and_mkinitramfs() {
+    echo "Prepare $mp for chroot"
+    mount -t proc proc $mp/proc
+    mount -t sysfs sys $mp/sys
+    mount --bind /dev $mp/dev
+    mount --bind /run $mp/run
+
+    if [ $only_subvols = yes ]
+    then
+        subvol_device=/dev/"$1"
     else
-        source=/dev/mapper/root
-        luks_uuid=$(blkid -s UUID -o value "$root_device")
-        printf 'root UUID=%s none luks\n' "$luks_uuid" >> /etc/crypttab
-        apt-get update
-        apt-get install -y --no-install-recommends cryptsetup systemd-cryptsetup
+        subvol_device=/dev/mapper/root
+    fi
+    mount "$subvol_device" -o subvol=@home $mp/home
+    mount "$subvol_device" -o subvol=@var_cache $mp/var/cache
+    mount "$subvol_device" -o subvol=@var_log $mp/var/log
+    mount "$subvol_device" -o subvol=@var_tmp $mp/var/tmp
+
+    mount /dev/"$2" $mp/boot
+    if [ ! -z "$3" ]
+    then
+        mkdir -p $mp/boot/efi
+        mount /dev/"$3" $mp/boot/efi
+    fi
+    cp "$script" $mp/tmp/"$scriptname"
+    chmod a+x $mp/tmp/"$scriptname"
+    echo "Chrooting and call the script in the other root"
+    chroot $mp /tmp/"$scriptname" //inner $only_subvols /dev/"$1"
+}
+
+unmount_everything() {
+    echo "Unmounting"
+    cd /
+    for dir in proc sys dev run
+    do
+        umount $mp/$dir
+    done
+    if [ $efi = true ]
+    then
+        umount $mp/boot/efi
+    fi
+    umount $mp/boot
+    umount $mp/var/tmp
+    umount $mp/var/log
+    umount $mp/var/cache
+    umount $mp/home
+    umount $mp
+    if [ $only_subvols = no ]
+    then
+        cryptsetup close root
+    fi
+}
+
+if [ "$1" = "//inner" ]
+then
+    only_subvols="$2"
+    root_uuid=`blkid --output export "$3" | grep ^UUID=`
+    if [ "$only_subvols" = "yes" ]
+    then
+        echo "Patch /etc/fstab"
+        sed --in-place "s!^.* / btrfs defaults 0 1\$!$root_uuid / btrfs defaults,subvol=@ 0 1!" /etc/fstab
+        device="$root_uuid"
+    else
+        echo "Patch /etc/fstab"
+        sed --in-place 's!^.* / btrfs defaults 0 1$!/dev/mapper/root / btrfs defaults,subvol=@ 0 1!' /etc/fstab
+        device=/dev/mapper/root
+        echo "root $root_uuid none luks,discard" > /etc/crypttab
+        # 26.04 uses Dracut by default; keep it instead of installing
+        # the upstream cryptsetup-initramfs package.
+        apt-get install -y systemd-cryptsetup
     fi
 
-    # Preserve the existing /boot and EFI entries, replace only Btrfs mounts.
-    awk '$1 !~ /^#/ && ($2=="/" || $2=="/home" || $2=="/var/cache" ||
-         $2=="/var/log" || $2=="/var/tmp") {next} {print}' \
-         /etc/fstab > /etc/fstab.btrfs-new
-    for pair in '/:@' '/home:@home' '/var/cache:@var_cache' \
-                '/var/log:@var_log' '/var/tmp:@var_tmp'; do
-        path=${pair%:*}
-        subvol=${pair#*:}
-        printf '%s %s btrfs defaults,subvol=%s 0 0\n' \
-            "$source" "$path" "$subvol" >> /etc/fstab.btrfs-new
-    done
-    mv /etc/fstab.btrfs-new /etc/fstab
+    echo "$device /home btrfs defaults,subvol=@home 0 2" >> /etc/fstab
+    echo "$device /var/cache btrfs defaults,subvol=@var_cache 0 2" >> /etc/fstab
+    echo "$device /var/log btrfs defaults,subvol=@var_log 0 2" >> /etc/fstab
+    echo "$device /var/tmp btrfs defaults,subvol=@var_tmp 0 2" >> /etc/fstab
 
-    # Ubuntu 26.04 fresh installs use Dracut, not initramfs-tools.
+    # Dracut must build for the installed filesystem, not the live USB.
     mkdir -p /etc/dracut.conf.d
-    {
-        echo 'hostonly="no"'
-        echo 'use_fstab="yes"'
-        echo 'add_dracutmodules+=" btrfs "'
-        if [ "$only_subvols" = no ]; then
-            echo 'add_dracutmodules+=" crypt "'
-            echo 'install_items+=" /etc/crypttab "'
-        fi
-    } > /etc/dracut.conf.d/95-btrfs-encrypt-root.conf
-    dracut --force --regenerate-all
+    echo 'hostonly="no"' > /etc/dracut.conf.d/90-btrfs-encrypt-root.conf
+    echo 'use_fstab="yes"' >> /etc/dracut.conf.d/90-btrfs-encrypt-root.conf
+    echo 'add_dracutmodules+=" btrfs "' >> /etc/dracut.conf.d/90-btrfs-encrypt-root.conf
+    if [ "$only_subvols" = "no" ]
+    then
+        echo 'add_dracutmodules+=" crypt "' >> /etc/dracut.conf.d/90-btrfs-encrypt-root.conf
+        echo 'install_items+=" /etc/crypttab "' >> /etc/dracut.conf.d/90-btrfs-encrypt-root.conf
+    fi
+    echo "Update initramfs"
+    dracut --regenerate-all --force
     update-grub
+    exit
+fi
+
+show_help() {
+    echo "Add @, @home and @var_* subvolumes to a Btrfs root partition,"
+    echo "and encrypt it optionally"
+    echo
+    echo "Usage: btrfs-encrypt-root [options] {root-dev} {boot-dev} [{efi-dev}]"
+    echo
+    echo "The devices must be given without the /dev/ prefix."
+    echo
+    echo "  --only-subvols            do not encrypt, only create subvolumes"
+    echo "  --enlarge                 enlarge root partition to maximum"
+    echo
+    echo "--enlarge resizes the root partition to 100%.  This makes encryption"
+    echo "much faster, because you make a small partition for just the"
+    echo "installation of the base system, and then you call this script,"
+    echo "which has to encrypt only the smaller partition.  The enlargement"
+    echo "covers only empty space, so no encryption is necessary there."
 }
 
-if [ "${1:-}" = //inner ]; then
-    configure_installed_system "$2" "$3"
-    exit 0
+if [ $# -eq 0 ]
+then
+    show_help
+    exit
 fi
 
 only_subvols=no
 enlarge=no
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --only-subvols) only_subvols=yes; shift ;;
-        --enlarge) enlarge=yes; shift ;;
-        -h|--help) show_help; exit 0 ;;
-        --*) fail "Unknown option: $1" ;;
-        *) break ;;
+
+while :; do
+    case $1 in
+        -h|-\?|--help)
+            show_help
+            exit
+            ;;
+        --only-subvols)
+            only_subvols=yes
+            ;;
+        --enlarge)
+            enlarge=yes
+            ;;
+        --*)
+            echo "Invalid option “$1”.  Use --help for more information."
+            exit 2
+            ;;
+        *)
+            break
     esac
+    shift
 done
-[ "$#" -ge 2 ] && [ "$#" -le 3 ] || { show_help; exit 2; }
-[ "$(id -u)" -eq 0 ] || fail 'Run as root'
-[ "$enlarge" = no ] || [ "$only_subvols" = no ] || fail 'Options are mutually exclusive'
-root=$1
-boot=$2
-efi=${3:-}
-[ "$(blkid -s TYPE -o value "/dev/$root")" = btrfs ] || fail 'Root must be Btrfs'
-[ "$(blkid -s TYPE -o value "/dev/$boot")" = ext4 ] || fail '/boot must be ext4'
-if [ -n "$efi" ]; then
-    [ "$(blkid -s TYPE -o value "/dev/$efi")" = vfat ] || fail 'EFI must be FAT32'
-fi
 
-# One necessary --enlarge safeguard. Numeric sector comparison, not text order.
-if [ "$enlarge" = yes ]; then
-    disk=$(lsblk -no PKNAME "/dev/$root" | tr -d '[:space:]')
-    partition_number=$(lsblk -no PARTN "/dev/$root" | tr -d '[:space:]')
-    last=$(parted -ms "/dev/$disk" unit s print | awk -F: \
-        '$1 ~ /^[0-9]+$/ && ($3+0)>max { max=$3+0; number=$1 } END {print number}')
-    [ "$partition_number" = "$last" ] || fail '--enlarge requires root to be the last partition'
-fi
-
-# Ubuntu's installer may still have the installed OS mounted under /target.
-if mountpoint -q /target; then umount -R /target; fi
-mkdir -p "$mp"
-mount -o subvolid=5 "/dev/$root" "$mp"
-[ -z "$(btrfs subvolume list "$mp")" ] || fail 'Expected a fresh Btrfs root with no subvolumes'
-
-# Snapshot the installed system and move home/var data into sibling subvolumes.
-btrfs subvolume snapshot "$mp" "$mp/@"
-for pair in 'home:@home' 'var/cache:@var_cache' 'var/log:@var_log' 'var/tmp:@var_tmp'; do
-    path=${pair%:*}
-    subvol=${pair#*:}
-    btrfs subvolume create "$mp/$subvol"
-    cp -a "$mp/@/$path/." "$mp/$subvol/"
-    find "$mp/@/$path" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-done
-chmod 1777 "$mp/@var_tmp"
-
-# Remove the original flat root, as the upstream script does.
-find "$mp" -mindepth 1 -maxdepth 1 \
-    ! -name '@' ! -name '@home' ! -name '@var_cache' \
-    ! -name '@var_log' ! -name '@var_tmp' -exec rm -rf -- {} +
-umount "$mp"
-
-if [ "$only_subvols" = no ]; then
-    mount -o subvol=@ "/dev/$root" "$mp"
-    btrfs filesystem resize -"$keyslot_size" "$mp"
-    umount "$mp"
-    cryptsetup reencrypt --encrypt --type luks2 --reduce-device-size "$keyslot_size" "/dev/$root"
-    if [ "$enlarge" = yes ]; then
-        parted --script "/dev/$disk" resizepart "$partition_number" 100%
-        partprobe "/dev/$disk"
-    fi
-    cryptsetup open "/dev/$root" root
-    root_source=/dev/mapper/root
+if [ -z "$3" ]
+then
+    efi=false
 else
-    root_source=/dev/$root
+    efi=true
 fi
 
-mount -o subvol=@ "$root_source" "$mp"
-btrfs filesystem resize max "$mp"
-for pair in 'home:@home' 'var/cache:@var_cache' 'var/log:@var_log' 'var/tmp:@var_tmp'; do
-    path=${pair%:*}
-    subvol=${pair#*:}
-    mount -o "subvol=$subvol" "$root_source" "$mp/$path"
-done
-
-# /boot/efi resides on the ext4 /boot partition, not on the Btrfs root.
-mount "/dev/$boot" "$mp/boot"
-if [ -n "$efi" ]; then
-    mkdir -p "$mp/boot/efi"
-    mount "/dev/$efi" "$mp/boot/efi"
+if [ -z "$1" -o -z "$2" ]
+then
+    echo "You must pass the device of the root, boot, and optionally "
+    echo "EFI partition (without the /dev/) to this script."
+    echo
+    echo "Use --help for more information."
+    exit 2
 fi
-mount -t proc proc "$mp/proc"
-mount --rbind /sys "$mp/sys"
-mount --rbind /dev "$mp/dev"
-mount --bind /run "$mp/run"
-cp "$script" "$mp/tmp/btrfs-encrypt-root.sh"
-chroot "$mp" /bin/sh /tmp/btrfs-encrypt-root.sh //inner "$only_subvols" "/dev/$root"
 
-umount -R "$mp"
-if [ "$only_subvols" = no ]; then cryptsetup close root; fi
-printf 'Finished. You can reboot.\n'
+preparation
+create_subvols "$1"
+if [ $only_subvols = no ]
+then
+    encrypt_and_enlarge "$1"
+fi
+chroot_and_mkinitramfs "$1" "$2" "$3"
+unmount_everything
+echo "Finished"
