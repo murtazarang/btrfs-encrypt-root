@@ -40,6 +40,9 @@ Install and convert
 
    Do not create separate home or var partitions, LVM, or Btrfs subvolumes.
 
+   For ``--enlarge``, make root smaller initially and leave the remaining space
+   unallocated immediately after it.
+
 2. Finish installation and select **Continue testing**, not reboot. Close the
    installer. Stay in this live session until conversion finishes.
 
@@ -77,6 +80,18 @@ Options and failures
 * ``--enlarge``: encrypts a smaller initial root partition, then extends it into
   trailing free space. Requires GPT and root to be the physically last partition.
   Cannot be combined with ``--only-subvols``.
+
+  "Last" means physical position on disk, not partition number or command argument
+  position. For example, from the start of the disk: ``p1 (EFI), p2 (/boot),
+  p3 (/), unallocated space``. Arguments must still be **ROOT BOOT EFI**, with
+  options first::
+
+    sudo sh btrfs-encrypt-root.sh --enlarge nvme0n1p3 nvme0n1p2 nvme0n1p1
+
+  Check physical positions and free space with::
+
+    sudo parted /dev/nvme0n1 unit GiB print free
+
 * ``--help``: prints usage without modifying disks.
 
 Checks reject mismatched devices, unexpected mounts, existing subvolumes,
