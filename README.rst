@@ -1,62 +1,178 @@
 btrfs-encrypt-root
 ==================
 
-Permanently forked from https://gitlab.com/bronger/btrfs-encrypt-root (no longer maintained).
+Fresh-install conversion for Ubuntu 26.04.1: LUKS2 encryption, a Timeshift-compatible
+Btrfs layout, and matching backups of the separate /boot partition.
 
-Preparing Ubuntu
-++++++++++++++++
+Fork of https://github.com/shukriadams/btrfs-encrypt-root, originally from
+https://gitlab.com/bronger/btrfs-encrypt-root.
 
-This fork is confirmed working on Ubuntu 26.04, original script linked above is confirmed
-working on 24.04. Must be applied during a full reinstall, does not work on existing installs.
+Layout
+------
 
-For a more detailed writeup see https://blog.shukriadams.com/tech/Ubuntu26_btrfs_and_timeshift.
+All five subvolumes share one encrypted Btrfs partition. The Btrfs default remains
+top-level ID 5; fstab mounts each subvolume by name.
 
-- Ensure you have UEFI enabled.
-- Boot into Ubuntu installation ISO, advance to disk setup, select "Manaul installation".
-- Delete all existing partitions on your root disk.
-- In "Device for boot loader" dropdown select root disk, this will automatically create a FAT32 partition mounted to `/boot/efi`, if this doesn't happen UEFI is not set up properly.
-- Create an EXT4 partition on root disk, make it 1GB in size, select `/boot` as its mount.
-- Create a BTRFS partition with remaining disk space, select `/` as its mount.
-- Continue with installation until you get the option to reboot, select "Continue testing" instead to exit to installer desktop, then follow original author's instructions below.
+============== =============== ================================
+Mount          Subvolume       Included in root snapshots
+============== =============== ================================
+/              @               Yes
+/home          @home           No
+/var/cache     @var_cache      No, including all cache contents
+/var/log       @var_log        No
+/var/tmp       @var_tmp        No
+/boot          Separate ext4   Saved by the included boot hooks
+/boot/efi      Separate FAT32  No
+============== =============== ================================
 
-Running script
-++++++++++++++
+/boot and the EFI System Partition remain unencrypted. No root-unlock key is
+placed in /boot or the initramfs.
 
-Since Ubuntu 23.04, it cannot be installed anymore on an encrypted Btrfs.
-Moreover, no @ and @home subvolumes are created automatically during
-installation.  Canonical deserted all users who had found a comfortable home in
-the Btrfs ecosystem.  Besides, Canonical actively removed the functionality,
-even in expert mode of the installer.
+Install and convert
+-------------------
 
-Be that as it may, this script brings it back.  You it call as root immediately
-after the installation of Ubuntu, from a live system.  You can copy the script
-on the USB stick with the live system, or download it with ``wget`` from this
-repository::
+1. Boot the Ubuntu 26.04.1 live USB in **UEFI mode**. In the installer, choose
+   manual partitioning. Use three partitions on the same installation disk:
 
-  wget https://raw.githubusercontent.com/shukriadams/btrfs-encrypt-root/refs/heads/master/btrfs-encrypt-root.sh
-  sudo sh btrfs-encrypt-root.sh sda3 sda2 sda1
+   * FAT32 EFI System Partition: about 1 GiB, mounted at /boot/efi.
+   * ext4: 2 GiB, mounted at /boot.
+   * Btrfs: remaining space, mounted at /, initially **unencrypted**.
 
+   Do not create separate home or var partitions, LVM, or Btrfs subvolumes.
 
-**Caution**: Use the script only if you trust the script, either because you
-can analyse it yourself, or because you trust someone who can.
+2. Finish installation and select **Continue testing**, not reboot. Close the
+   installer. Stay in this live session until conversion finishes.
 
-It assumes that you want to have ``/`` and ``/home`` on the same partition, and
-that there is a separate partition for ``/boot``.  Then, the three parameters
-are:
+3. Check device names with ``lsblk -f``. The script requires a fresh, flat,
+   single-device Btrfs installation with no existing subvolumes. If the installer
+   created swap, disable that swapfile and remove its file and fstab entry before
+   conversion. Configure swap afterward outside @ and @home, or use zram.
 
-- the device name for ``/``
-- the device name for ``/boot``
-- the device name for ``/boot/efi`` (optional)
+4. Connect to the internet. Install live-session dependencies and download this
+   fork's script::
 
-All three without the ``/dev/`` prefix.
+     sudo apt update
+     sudo apt install btrfs-progs cryptsetup rsync parted python3 curl
+     curl -fL -o btrfs-encrypt-root.sh https://raw.githubusercontent.com/murtazarang/btrfs-encrypt-root/master/btrfs-encrypt-root.sh
+     less btrfs-encrypt-root.sh
 
-The script then encrypts the root partition and creates the subvolumes ``@``
-for ``/`` and ``@home`` for ``/home``.  If you pass ``--only-subvols`` as the
-first parameter, no encryption happens but only the subvolumes are created.
+5. Run it with **ROOT BOOT EFI**, without the /dev/ prefix. For example, only if
+   these are your actual partitions::
 
-If you pass the ``--enlarge`` parameter, the root partition is enlarged to the
-complete available space after the encryption.  This makes encryption much
-faster, because you make a small partition for just the installation of the
-base system, and then you call this script, which has to encrypt only the
-smaller partition.  The enlargement covers only empty space, so no encryption
-is necessary there.
+     sudo sh btrfs-encrypt-root.sh nvme0n1p3 nvme0n1p2 nvme0n1p1
+
+   Confirm the displayed installation disk and choose your LUKS passphrase when
+   prompted. The script installs target packages, migrates files with metadata,
+   encrypts root, updates fstab/crypttab, and rebuilds all initramfs images and
+   GRUB configuration.
+
+6. Reboot only after the script reports success. Verify passphrase unlock and
+   normal startup before creating your first Timeshift snapshot.
+
+Options and failures
+--------------------
+
+* ``--only-subvols``: creates the same layout and Timeshift setup without
+  encryption.
+* ``--enlarge``: encrypts a smaller initial root partition, then extends it into
+  trailing free space. Requires GPT and root to be the physically last partition.
+  Cannot be combined with ``--only-subvols``.
+* ``--help``: prints usage without modifying disks.
+
+Checks reject mismatched devices, unexpected mounts, existing subvolumes,
+configured swap, insufficient migration space, and partial conversions.
+The script is **not safely rerunnable after conversion starts**. If it fails,
+do not blindly rerun or reboot; inspect the reported stage. Reinstalling is the
+simplest recovery for a disposable fresh installation.
+
+Timeshift and /boot
+------------------
+
+Timeshift is configured for Btrfs snapshots of @, with home excluded and all
+schedules initially disabled. After your first successful boot, create a snapshot
+while APT, dpkg, and kernel updates are idle::
+
+  sudo timeshift --create --comments "Fresh installation" --tags O
+
+The backup hook must report ``Timeshift boot backup complete``. Each completed
+snapshot contains ``boot-state/READY``, a checksummed /boot archive, and the
+root/boot UUIDs alongside its @ directory. Then configure your preferred schedule
+in Timeshift.
+
+Restoring a snapshot also restores its matching kernel, initramfs, and grub.cfg.
+The hooks check filesystem UUIDs and the restored subvolume before writing /boot.
+They do not roll back the EFI partition or firmware boot entries.
+
+**Timeshift ignores hook failures.** Check the boot-hook completion message and
+markers; Timeshift's own success message is insufficient. Its automatic
+"Before restoring" snapshot does not run the backup hook and has no boot archive.
+Create and check a normal snapshot before initiating a rollback.
+
+Restore, including from a live USB
+---------------------------------
+
+For live recovery, boot the same Ubuntu live USB in UEFI mode, install the tools,
+and unlock the root partition, replacing the example device::
+
+  sudo apt update
+  sudo apt install timeshift btrfs-progs cryptsetup rsync
+  sudo cryptsetup open /dev/nvme0n1p3 root
+
+For either live or installed-system recovery, mount Btrfs top level and list the
+snapshots. Skip the unlock command above if root is already unlocked::
+
+  sudo mkdir -p /mnt/btrfs
+  sudo mount -o subvolid=5 /dev/mapper/root /mnt/btrfs
+  sudo ls /mnt/btrfs/timeshift-btrfs/snapshots
+
+Set SNAPSHOT to the chosen directory, replacing TIMESTAMP below. Check that the
+boot backup completed and its checksums match. **Stop if either check fails**::
+
+  SNAPSHOT=/mnt/btrfs/timeshift-btrfs/snapshots/TIMESTAMP
+  sudo test -s "$SNAPSHOT/boot-state/READY"
+  sudo sh -c 'cd "$1/boot-state" && sha256sum -c SHA256SUMS' sh "$SNAPSHOT"
+
+Copy that snapshot's self-contained restore hook into the current session. This
+is required on a live USB because Timeshift runs restore hooks in the current
+system. Clear the previous success marker and restore the selected snapshot::
+
+  sudo install -d /etc/timeshift/restore-hooks.d
+  sudo install -m 700 "$SNAPSHOT/@/etc/timeshift/restore-hooks.d/50-boot" /etc/timeshift/restore-hooks.d/50-boot
+  sudo rm -f "$SNAPSHOT/boot-state/restore-OK"
+  sudo timeshift --btrfs --snapshot-device /dev/mapper/root \
+    --restore --snapshot "${SNAPSHOT##*/}" --target-device /dev/mapper/root
+
+Confirm that same snapshot and root filesystem. **Decline automatic reboot.**
+Require the ``Timeshift boot restore complete`` message and check the newly
+created success marker before rebooting::
+
+  sudo test -s "$SNAPSHOT/boot-state/restore-OK"
+  sudo test ! -e "$SNAPSHOT/boot-state/restore-FAILED"
+
+With ``--only-subvols``, use the unencrypted root partition instead of
+/dev/mapper/root in these recovery commands.
+
+Package baseline and optional YubiKey
+------------------------------------
+
+Targets stable Ubuntu 26.04.1 packages as of **2026-10-24**, using official Ubuntu
+repositories and normal updates, without version pinning:
+
+* `Timeshift 25.12.4-1 <https://packages.ubuntu.com/resolute/timeshift>`_
+  (Btrfs backup/restore hook support).
+* `btrfs-progs 6.17.1-1build1 <https://packages.ubuntu.com/resolute/btrfs-progs>`_.
+* `cryptsetup / cryptsetup-initramfs 2:2.8.4-1ubuntu4 <https://packages.ubuntu.com/source/resolute/cryptsetup>`_.
+* `Dracut 110-11ubuntu0.1 <https://manpages.ubuntu.com/manpages/resolute/man8/update-initramfs.8.html>`_.
+
+The script also installs systemd-cryptsetup. It configures Dracut for a chroot
+build from fstab and checks that encrypted-root initramfs images contain crypttab.
+
+A YubiKey can be added later to the existing LUKS2 container with
+`systemd-cryptenroll <https://www.freedesktop.org/software/systemd/man/259/systemd-cryptenroll.html>`_,
+without reinstalling. FIDO2 unlocking needs
+`hmac-secret support <https://docs.yubico.com/hardware/yubikey/yk-tech-manual/yk5-apps-fido.html>`_
+(YubiKey 5C firmware 5.2 or later), appropriate crypttab/initramfs configuration,
+and a boot test. Keep a working recovery passphrase.
+
+Keep an independent encrypted backup of your files: same-disk snapshots do not
+protect against disk failure.
