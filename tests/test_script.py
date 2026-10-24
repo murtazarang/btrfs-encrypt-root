@@ -372,6 +372,68 @@ exec /usr/bin/mktemp "$@"
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(ready.read_text(), "complete\n")
 
+    def partition_table(self, rows):
+        return ("BYT;\n"
+                "/dev/nvme1n1:15628053168s:nvme:512:512:gpt:Test disk:;\n"
+                + "\n".join(rows) + "\n")
+
+    def test_enlarge_accepts_physically_last_root_across_digit_lengths(self):
+        table = self.partition_table([
+            "1:2048s:2099199s:2097152s:fat32:EFI:boot, esp;",
+            "2:2099200s:6293503s:4194304s:ext4:boot:;",
+            "3:6293504s:134217727s:127924224s:btrfs:root:;",
+        ])
+        result = self.shell('assert_root_last_partition "$1" "$2"', "3", table)
+        self.assert_success(result)
+
+    def test_enlarge_uses_position_not_partition_number_or_row_order(self):
+        table = self.partition_table([
+            "1:6293504s:134217727s:127924224s:btrfs:root:;",
+            "2:2048s:2099199s:2097152s:fat32:EFI:boot, esp;",
+            "3:2099200s:6293503s:4194304s:ext4:boot:;",
+        ])
+        result = self.shell('assert_root_last_partition "$1" "$2"', "1", table)
+        self.assert_success(result)
+
+    def test_enlarge_rejects_root_before_another_partition(self):
+        table = self.partition_table([
+            "1:2048s:2099199s:2097152s:fat32:EFI:boot, esp;",
+            "2:134217728s:138412031s:4194304s:ext4:boot:;",
+            "3:2099200s:134217727s:132118528s:btrfs:root:;",
+        ])
+        result = self.shell('assert_root_last_partition "$1" "$2"', "3", table)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("physically last partition", result.stderr)
+
+    def test_enlarge_rejects_missing_root_partition(self):
+        table = self.partition_table([
+            "1:2048s:2099199s:2097152s:fat32:EFI:boot, esp;",
+            "2:2099200s:6293503s:4194304s:ext4:boot:;",
+        ])
+        result = self.shell('assert_root_last_partition "$1" "$2"', "3", table)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("physically last partition", result.stderr)
+
+    def test_enlarge_handles_large_sector_numbers_without_rounding(self):
+        table = self.partition_table([
+            "1:2048s:2099199s:2097152s:fat32:EFI:boot, esp;",
+            "2:2099200s:9999999999s:9997900800s:ext4:boot:;",
+            "3:10000000000s:15628052479s:5628052480s:btrfs:root:;",
+        ])
+        result = self.shell('assert_root_last_partition "$1" "$2"', "3", table)
+        self.assert_success(result)
+
+    def test_enlarge_rejects_invalid_partition_numbers(self):
+        table = self.partition_table([
+            "3:6293504s:134217727s:127924224s:btrfs:root:;",
+        ])
+        for number in ("", "0", "not-a-number", "3 4", "3\n4"):
+            with self.subTest(number=number):
+                result = self.shell('assert_root_last_partition "$1" "$2"',
+                                    number, table)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("valid root partition number", result.stderr)
+
     def test_shell_syntax(self):
         result = subprocess.run(["/bin/sh", "-n", str(SCRIPT)], text=True,
                                 capture_output=True, timeout=10)
