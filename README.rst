@@ -20,7 +20,7 @@ Running the script
 
 From the live USB desktop, download the script with wget::
 
-  wget https://raw.githubusercontent.com/murtazarang/btrfs-encrypt-root/master/btrfs-encrypt-root.sh
+  wget https://raw.githubusercontent.com/murtazarang/btrfs-encrypt-root/main/btrfs-encrypt-root.sh
 
 Identify the partition names with ``lsblk -f``. Then run ROOT BOOT EFI, in that
 order, without the ``/dev/`` prefix (example only)::
