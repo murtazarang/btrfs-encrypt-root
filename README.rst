@@ -3,6 +3,7 @@ btrfs-encrypt-root
 
 Minimal fork of https://github.com/shukriadams/btrfs-encrypt-root, for fresh
 Ubuntu 26.04 installations. Requires UEFI and a separate /boot partition.
+
 Note: Built with Codex, verified on multiple installations, but please check or verify it yourself before you use it.
 
 Preparing Ubuntu
