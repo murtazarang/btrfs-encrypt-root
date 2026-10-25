@@ -3,6 +3,7 @@ btrfs-encrypt-root
 
 Minimal fork of https://github.com/shukriadams/btrfs-encrypt-root, for fresh
 Ubuntu 26.04 installations. Requires UEFI and a separate /boot partition.
+Note: Built with Codex, verified on multiple installations, but please check or verify it yourself before you use it.
 
 Preparing Ubuntu
 ++++++++++++++++
@@ -20,7 +21,7 @@ Running the script
 
 From the live USB desktop, download the script with wget::
 
-  wget https://raw.githubusercontent.com/murtazarang/btrfs-encrypt-root/main/btrfs-encrypt-root.sh
+  wget https://raw.githubusercontent.com/murtazarang/btrfs-encrypt-root/master/btrfs-encrypt-root.sh
 
 Identify the partition names with ``lsblk -f``. Then run ROOT BOOT EFI, in that
 order, without the ``/dev/`` prefix (example only)::
@@ -53,5 +54,34 @@ non-recursive bind mounts. Ubuntu 26.04 uses Dracut; during encrypted installs
 the script installs ``systemd-cryptsetup`` inside the installed system instead
 of upstream's ``cryptsetup-initramfs``. No live-USB apt commands are required.
 
-After the first reboot, install/configure Timeshift in Btrfs mode. Back up home
-separately. A YubiKey can be enrolled into LUKS2 later, retaining a passphrase.
+First-time Timeshift setup (after the first reboot)
++++++++++++++++++++++++++++++++++++++++++++++++
+
+Do this in the installed Ubuntu system, **not** on the live USB.
+
+1. Install Timeshift from Ubuntu's repository::
+
+     sudo apt update
+     sudo apt install timeshift
+
+2. Open **Timeshift** from the application menu.
+3. In the first-run wizard, choose **BTRFS** (not RSYNC).
+4. Select the Btrfs root filesystem (the decrypted LUKS2 volume) as the
+   snapshot location. It contains the ``@`` and ``@home`` subvolumes.
+5. Keep **Include BTRFS @home subvolume** disabled for both snapshots and
+   restores, where those options are shown. Choose any snapshot schedule
+   you prefer, or disable scheduled snapshots.
+6. Finish the wizard, click **Create** for the first snapshot, and confirm
+   it appears in Timeshift's snapshot list.
+
+Only ``@`` is snapshotted. The separate ``@home``, ``@var_cache``,
+``@var_log`` and ``@var_tmp`` subvolumes are not included in that snapshot.
+These exclusions come from the Btrfs layout; no Timeshift exclusion rules
+or custom snapshot hooks are needed.
+
+**Important:** ``/boot`` is a separate ext4 partition and is **not** backed
+up by Btrfs snapshots. Keep a separate ``/boot`` backup, especially before
+kernel updates, so a restored ``@`` can be matched with the right kernel.
+``/boot/efi`` and your personal files also need separate backups.
+
+A YubiKey can be enrolled into LUKS2 later, retaining a passphrase.
