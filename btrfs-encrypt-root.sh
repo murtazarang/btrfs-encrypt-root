@@ -19,7 +19,15 @@ preparation() {
         umount /target/boot/efi
     fi
     umount /target/boot
-    umount /target/cdrom
+    # The Server installer may not leave the ISO bound here.
+    if [ -e /target/cdrom ]; then
+        if mountpoint -q /target/cdrom; then
+            umount /target/cdrom
+        elif [ "$?" -ne 32 ]; then
+            echo "ERROR: Could not check mount point /target/cdrom." >&2
+            return 1
+        fi
+    fi
     umount /target
 
     mkdir $mp
