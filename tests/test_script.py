@@ -42,6 +42,45 @@ class CurrentScriptTests(unittest.TestCase):
        r=subprocess.run(['/bin/sh',str(SCRIPT),*args],env=self.env,cwd=self.root,text=True,capture_output=True,timeout=10)
        self.assertEqual(r.returncode,2 if args==('--not-a-real-option',) else 0,r.stderr)
        self.assertFalse(self.log.exists(),'storage command was invoked')
+ def prepare_target(self, present, mount_status=0, unmount_status=0):
+    cdrom=self.root/'cdrom'
+    if present: cdrom.mkdir()
+    self.stub('mountpoint',f'#!/bin/sh\n[ "$1" = -q ] && [ "$2" = "$TEST_CDROM" ] || exit 99\nexit {mount_status}\n')
+    self.stub('umount',f'#!/bin/sh\nprintf "%s\\n" "$1" >> "$TEST_LOG"\nif [ "$1" = "$TEST_CDROM" ]; then exit {unmount_status}; fi\n')
+    self.env['TEST_CDROM']=str(cdrom)
+    mp=self.root/'work'
+    r=self.run_shell('set -e; efi=true; mp=$1\n'+function('preparation').replace('/target/cdrom',str(cdrom))+'\npreparation',mp)
+    return r, self.log.read_text().splitlines(), mp.is_dir()
+
+ def test_preparation_skips_absent_or_unmounted_cdrom(self):
+    for present in (False,True):
+      with self.subTest(present=present):
+        self.log.unlink(missing_ok=True)
+        r,calls,created=self.prepare_target(present,32 if present else 99)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertEqual(calls,['/target/boot/efi','/target/boot','/target'])
+        self.assertTrue(created)
+        (self.root/'work').rmdir()
+
+ def test_preparation_unmounts_cdrom_before_target(self):
+    r,calls,created=self.prepare_target(True)
+    self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+    self.assertEqual(calls,['/target/boot/efi','/target/boot',str(self.root/'cdrom'),'/target'])
+    self.assertTrue(created)
+
+ def test_preparation_stops_if_cdrom_unmount_fails(self):
+    r,calls,created=self.prepare_target(True,unmount_status=16)
+    self.assertEqual(r.returncode,16)
+    self.assertEqual(calls,['/target/boot/efi','/target/boot',str(self.root/'cdrom')])
+    self.assertFalse(created)
+
+ def test_preparation_stops_if_mountpoint_check_errors(self):
+    r,calls,created=self.prepare_target(True,mount_status=1)
+    self.assertEqual(r.returncode,1)
+    self.assertIn('Could not check mount point',r.stderr)
+    self.assertEqual(calls,['/target/boot/efi','/target/boot'])
+    self.assertFalse(created)
+
  def test_subvolume_creation_preserves_contents_and_excludes_home(self):
     fs=self.root/'filesystem'; fs.mkdir()
     for p in ['home','var/cache','var/log','var/tmp']: (fs/p).mkdir(parents=True,exist_ok=True)
